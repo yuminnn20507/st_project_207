@@ -1,117 +1,513 @@
-years_found = sorted(paired["연도"].dropna().astype(int).unique().tolist())
-st.success(f"전처리 완료: {len(paired):,}개의 연도-연령군 짝을 찾았습니다.")
-if years_found != YEARS:
-    st.warning(f"자료에서 확인된 연도는 {years_found}입니다. 2021~2025년 전체가 포함되어 있는지 확인해 주세요.")
+import re
+from io import BytesIO
+from pathlib import Path
 
-with st.expander("원본 데이터에서 자동으로 찾은 열 확인"):
-    labels = ["진료년도", "주상병코드", "성별", "연령군", "환자수"]
-    for label, col in zip(labels, detected):
-        st.write(f"- {label}: {col if col is not None else '해당 열 없음'}")
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import streamlit as st
+from scipy.stats import pearsonr, spearmanr
 
-# ---------- 요약 ----------
-periodontal = "치주질환(K05)"
-diabetes = "2형 당뇨병(E11)"
-total_rows = len(paired)
-c1, c2, c3 = st.columns(3)
-c1.metric("분석 연도", f"{len(years_found)}개")
-c2.metric("분석 연령군-연도 짝", f"{total_rows:,}개")
-c3.metric("분석 연령 범위", f"{int(paired['연령시작'].min())}세 이상")
+
+# ==============================
+# 기본 설정
+# ==============================
+
+st.set_page_config(
+    page_title="잇몸병과 당뇨병의 상관관계",
+    page_icon="🦷",
+    layout="wide"
+)
+
+st.title("🦷 치주질환과 2형 당뇨병의 상관관계")
+
+st.markdown("""
+### 탐구 질문
+
+**2025년 우리나라 성인의 연령대별 치주질환 환자 수와
+2형 당뇨병 환자 수 사이에는 어떤 상관관계가 있을까?**
+
+건강보험심사평가원의 통계자료를 활용하여
+연령대별 환자 수를 비교하고 상관관계를 분석합니다.
+""")
+
+PERIODONTAL = "치주질환(K05)"
+DIABETES = "2형 당뇨병(E11)"
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
+# ==============================
+# CSV 불러오기
+# ==============================
+
+@st.cache_data
+def load_csv(file_bytes):
+
+    for encoding in ["utf-8-sig", "cp949", "euc-kr", "utf-8"]:
+
+        try:
+
+            return pd.read_csv(
+                BytesIO(file_bytes),
+                encoding=encoding,
+                low_memory=False
+            )
+
+        except Exception:
+            continue
+
+    raise ValueError("CSV 파일을 읽을 수 없습니다.")
+
+
+# ==============================
+# 연령 처리
+# ==============================
+
+def extract_age(value):
+
+    text = str(value).strip()
+
+    match = re.search(r"(\d+)", text)
+
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+# ==============================
+# 데이터 전처리
+# ==============================
+
+def prepare_data(df):
+
+    required_columns = [
+        "진료년도",
+        "주상병코드",
+        "성별",
+        "연령군",
+        "환자수"
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+
+            raise ValueError(
+                f"필수 열이 없습니다: {column}"
+            )
+
+    data = df.copy()
+
+    # 2025년 데이터만 추출
+    data = data[
+        data["진료년도"].astype(str).str.contains("2025")
+    ].copy()
+
+    # 코드 문자열 정리
+    data["주상병코드"] = (
+        data["주상병코드"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # 연령군에서 숫자 추출
+    data["연령시작"] = data["연령군"].apply(
+        extract_age
+    )
+
+    # 환자수 숫자 변환
+    data["환자수"] = pd.to_numeric(
+        data["환자수"],
+        errors="coerce"
+    )
+
+    # 성인 20세 이상만 추출
+    data = data[
+        data["연령시작"] >= 20
+    ].copy()
+
+    # 질환 코드 구분
+    data["질환"] = np.select(
+        [
+            data["주상병코드"].str.startswith("K05"),
+            data["주상병코드"].str.startswith("E11")
+        ],
+        [
+            PERIODONTAL,
+            DIABETES
+        ],
+        default=""
+    )
+
+    # 두 질환만 선택
+    data = data[
+        data["질환"] != ""
+    ].copy()
+
+    # 남녀 환자 수 합산
+    grouped = (
+        data.groupby(
+            ["연령군", "연령시작", "질환"],
+            as_index=False
+        )["환자수"]
+        .sum()
+    )
+
+    # 질환별로 열 분리
+    paired = grouped.pivot_table(
+        index=["연령군", "연령시작"],
+        columns="질환",
+        values="환자수",
+        aggfunc="sum"
+    ).reset_index()
+
+    paired.columns.name = None
+
+    # 두 질환의 열이 존재하는지 확인
+    for disease in [PERIODONTAL, DIABETES]:
+
+        if disease not in paired.columns:
+
+            paired[disease] = np.nan
+
+    # 두 질환의 값이 모두 있는 연령대만 분석
+    paired = paired.dropna(
+        subset=[PERIODONTAL, DIABETES]
+    )
+
+    # 연령순 정렬
+    paired = paired.sort_values(
+        "연령시작"
+    ).reset_index(drop=True)
+
+    return paired, grouped
+
+
+# ==============================
+# 상관계수 계산
+# ==============================
+
+def calculate_correlation(data, method):
+
+    clean = data[
+        [PERIODONTAL, DIABETES]
+    ].dropna()
+
+    if len(clean) < 3:
+
+        return None
+
+    if (
+        clean[PERIODONTAL].nunique() < 2
+        or clean[DIABETES].nunique() < 2
+    ):
+
+        return None
+
+    if method == "Pearson":
+
+        r, p = pearsonr(
+            clean[PERIODONTAL],
+            clean[DIABETES]
+        )
+
+    else:
+
+        r, p = spearmanr(
+            clean[PERIODONTAL],
+            clean[DIABETES]
+        )
+
+    return {
+        "r": r,
+        "p": p,
+        "n": len(clean)
+    }
+
+
+# ==============================
+# 데이터 파일 선택
+# ==============================
+
+st.sidebar.header("데이터 불러오기")
+
+uploaded_file = st.sidebar.file_uploader(
+    "CSV 파일 업로드",
+    type=["csv"]
+)
+
+csv_files = (
+    list(DATA_DIR.glob("*.csv"))
+    if DATA_DIR.exists()
+    else []
+)
+
+
+if uploaded_file is not None:
+
+    raw_data = load_csv(
+        uploaded_file.getvalue()
+    )
+
+    file_name = uploaded_file.name
+
+elif csv_files:
+
+    selected_file = st.sidebar.selectbox(
+        "data 폴더의 CSV 선택",
+        csv_files,
+        format_func=lambda x: x.name
+    )
+
+    raw_data = load_csv(
+        selected_file.read_bytes()
+    )
+
+    file_name = selected_file.name
+
+else:
+
+    st.warning(
+        "CSV 파일을 업로드하거나 "
+        "GitHub의 data 폴더에 파일을 넣어주세요."
+    )
+
+    st.stop()
+
+
+st.caption(
+    f"사용 파일: {file_name}"
+)
+
+
+# ==============================
+# 전처리 실행
+# ==============================
+
+try:
+
+    paired, grouped = prepare_data(
+        raw_data
+    )
+
+except Exception as error:
+
+    st.error(
+        f"데이터 처리 오류: {error}"
+    )
+
+    st.stop()
+
+
+if paired.empty:
+
+    st.error(
+        "분석할 데이터가 없습니다. "
+        "2025년 K05와 E11 코드 및 "
+        "20세 이상 연령대 자료를 확인해주세요."
+    )
+
+    st.stop()
+
+
+st.success(
+    f"전처리 완료! {len(paired)}개 연령대 분석"
+)
+
+
+# ==============================
+# 요약
+# ==============================
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric(
+    "분석 연령대 수",
+    f"{len(paired)}개"
+)
+
+col2.metric(
+    "분석 연도",
+    "2025년"
+)
+
+col3.metric(
+    "분석 대상",
+    "20세 이상"
+)
+
+
+# ==============================
+# 연령대별 환자 수 비교
+# ==============================
 
 st.subheader("1. 연령대별 환자 수 비교")
-selected_year = st.selectbox("연도 선택", years_found, index=len(years_found)-1)
-year_data = paired[paired["연도"] == selected_year].sort_values("연령시작")
-if not year_data.empty:
-    long_year = year_data.melt(
-        id_vars=["연령군", "연령시작"],
-        value_vars=[periodontal, diabetes],
-        var_name="질환", value_name="환자수"
-    )
-    fig_bar = px.bar(
-        long_year, x="연령군", y="환자수", color="질환", barmode="group",
-        title=f"{selected_year}년 연령대별 치주질환·2형 당뇨병 환자 수",
-        labels={"연령군": "연령대", "환자수": "환자 수(명)", "질환": "질환"}
-    )
-    fig_bar.update_layout(xaxis_title="연령대", yaxis_title="환자 수(명)", legend_title="질환")
-    st.plotly_chart(fig_bar, use_container_width=True)
 
-st.subheader("2. 두 질환 환자 수의 산점도")
-plot_data = paired.copy()
-fig_scatter = px.scatter(
-    plot_data, x=periodontal, y=diabetes, color=plot_data["연도"].astype(str),
-    hover_data=["연도", "연령군"], trendline="ols",
-    labels={
-        periodontal: "치주질환 환자 수(명)",
-        diabetes: "2형 당뇨병 환자 수(명)",
-        "color": "진료년도"
-    },
-    title="연도·연령군별 치주질환 환자 수와 2형 당뇨병 환자 수"
+
+chart_data = paired.melt(
+    id_vars=["연령군", "연령시작"],
+    value_vars=[PERIODONTAL, DIABETES],
+    var_name="질환",
+    value_name="환자 수"
 )
-fig_scatter.update_layout(xaxis_title="치주질환 환자 수(명)", yaxis_title="2형 당뇨병 환자 수(명)")
-st.plotly_chart(fig_scatter, use_container_width=True)
+
+
+fig = px.bar(
+    chart_data,
+    x="연령군",
+    y="환자 수",
+    color="질환",
+    barmode="group",
+    title="2025년 연령대별 치주질환과 2형 당뇨병 환자 수",
+    labels={
+        "연령군": "연령대",
+        "환자 수": "환자 수(명)",
+        "질환": "질환"
+    }
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+
+# ==============================
+# 산점도
+# ==============================
+
+st.subheader("2. 두 질환의 환자 수 관계")
+
+
+scatter_fig = px.scatter(
+    paired,
+    x=PERIODONTAL,
+    y=DIABETES,
+    hover_data=["연령군"],
+    title="연령대별 치주질환과 2형 당뇨병 환자 수 관계",
+    labels={
+        PERIODONTAL: "치주질환 환자 수(명)",
+        DIABETES: "2형 당뇨병 환자 수(명)"
+    }
+)
+
+st.plotly_chart(
+    scatter_fig,
+    use_container_width=True
+)
+
+
+# ==============================
+# 상관계수 분석
+# ==============================
 
 st.subheader("3. 상관계수 분석")
-method_choice = st.radio("상관계수 표시", ["Pearson", "Spearman", "둘 다"], horizontal=True)
-pooled_results = {}
-if method_choice in ("Pearson", "둘 다"):
-    pooled_results["Pearson"] = corr_result(paired, periodontal, diabetes, "Pearson")
-if method_choice in ("Spearman", "둘 다"):
-    pooled_results["Spearman"] = corr_result(paired, periodontal, diabetes, "Spearman")
 
-cols = st.columns(max(1, len(pooled_results)))
-for col, (method, result) in zip(cols, pooled_results.items()):
-    with col:
-        if result is None:
-            st.warning(f"{method}: 계산에 필요한 자료가 부족합니다.")
-        else:
-            st.metric(f"{method} 상관계수", f"{result['r']:.3f}")
-            st.write(f"p-value: **{result['p']:.4g}**")
-            st.write(f"표본 수: **{result['n']}개**")
 
-st.caption("상관계수 0은 선형 관계가 없음을 기준으로 삼는 값입니다. p-value는 통계적 유의성을 살펴보는 참고값이며, 인과관계를 증명하지 않습니다.")
+pearson_result = calculate_correlation(
+    paired,
+    "Pearson"
+)
 
-st.subheader("4. 연도별 상관관계")
-annual_rows = []
-for year in years_found:
-    subset = paired[paired["연도"] == year]
-    for method in ("Pearson", "Spearman"):
-        result = corr_result(subset, periodontal, diabetes, method)
-        if result is not None:
-            annual_rows.append({"연도": year, "방법": method, "상관계수": result["r"], "p-value": result["p"], "표본 수": result["n"]})
-annual_df = pd.DataFrame(annual_rows)
-if not annual_df.empty:
-    st.dataframe(annual_df.round({"상관계수": 3, "p-value": 4}), use_container_width=True, hide_index=True)
-    fig_annual = px.line(
-        annual_df, x="연도", y="상관계수", color="방법", markers=True,
-        title="연도별 연령군 간 상관계수 변화",
-        labels={"연도": "진료년도", "상관계수": "상관계수", "방법": "분석 방법"}
-    )
-    fig_annual.add_hline(y=0, line_dash="dash", line_color="gray")
-    fig_annual.update_yaxes(range=[-1.05, 1.05])
-    st.plotly_chart(fig_annual, use_container_width=True)
-else:
-    st.info("연도별 상관계수를 계산하기에 연령군 자료가 충분하지 않습니다.")
+spearman_result = calculate_correlation(
+    paired,
+    "Spearman"
+)
 
-st.subheader("5. 전처리된 분석 자료")
+
+col1, col2 = st.columns(2)
+
+
+if pearson_result is not None:
+
+    with col1:
+
+        st.metric(
+            "피어슨 상관계수",
+            f"{pearson_result['r']:.3f}"
+        )
+
+        st.write(
+            f"p-value: {pearson_result['p']:.4g}"
+        )
+
+
+if spearman_result is not None:
+
+    with col2:
+
+        st.metric(
+            "스피어만 상관계수",
+            f"{spearman_result['r']:.3f}"
+        )
+
+        st.write(
+            f"p-value: {spearman_result['p']:.4g}"
+        )
+
+
+st.markdown("""
+- **피어슨 상관계수:** 두 변수 사이의 선형 관계를 측정합니다.
+- **스피어만 상관계수:** 두 변수의 순위에 따른 관계를 측정합니다.
+- **p-value:** 관찰된 관계가 통계적으로 유의한지 판단할 때 참고합니다.
+
+상관관계가 높다고 해서 한 질병이 다른 질병을
+직접 유발한다고 단정할 수는 없습니다.
+""")
+
+
+# ==============================
+# 분석 자료 확인
+# ==============================
+
+st.subheader("4. 전처리된 분석 데이터")
+
+
 st.dataframe(
-    paired.rename(columns={
-        periodontal: "치주질환 환자 수",
-        diabetes: "2형 당뇨병 환자 수"
-    }),
+    paired,
     use_container_width=True,
     hide_index=True
 )
-csv_out = paired.to_csv(index=False).encode("utf-8-sig")
-st.download_button("전처리 결과 CSV 다운로드", csv_out, "periodontal_diabetes_paired.csv", "text/csv")
 
-st.subheader("해석할 때 주의할 점")
-st.markdown(
-    """
-    - 이 분석은 **환자 수의 상관관계**를 확인하며, 치주질환이 당뇨병을 일으킨다거나 그 반대라고 증명하지 않습니다.
-    - 연령대별 인구 규모가 다르므로 환자 수가 많다는 사실만으로 해당 연령대의 질병 위험이 더 높다고 단정할 수 없습니다.
-    - 인구 대비 발생 비율 또는 유병률을 분석하려면 연령대별 인구 자료가 추가로 필요합니다.
-    - 건강보험 청구자료의 환자 수는 실제 전체 환자 수나 질병의 중증도를 완벽하게 나타내지 않을 수 있습니다.
-    - 전체 연도·연령군을 한꺼번에 계산한 상관계수는 연령과 시간의 영향을 받을 수 있으므로, 연도별 결과와 함께 해석해야 합니다.
-    """
+
+# ==============================
+# 다운로드
+# ==============================
+
+csv_download = paired.to_csv(
+    index=False
+).encode("utf-8-sig")
+
+
+st.download_button(
+    "분석 데이터 CSV 다운로드",
+    data=csv_download,
+    file_name="2025_치주질환_당뇨병_분석자료.csv",
+    mime="text/csv"
 )
 
-st.caption("자료 출처: 건강보험심사평가원, 공공데이터포털의 3단상병별 성별 연령군별 통계. 분석 기간은 2021~2025년으로 설정되어 있습니다.")
+
+# ==============================
+# 한계
+# ==============================
+
+st.subheader("5. 분석의 한계")
+
+
+st.markdown("""
+1. 2025년 단일 연도의 자료이므로 최근 5년간의 증가 추세는 분석하지 못합니다.
+2. 연령대별 환자 수만 비교하므로 인구 규모의 차이가 결과에 영향을 줄 수 있습니다.
+3. 환자 수가 많다는 사실이 해당 연령대의 질병 발생 위험이 높다는 의미는 아닙니다.
+4. 건강보험 청구자료는 의료기관을 이용한 기록을 바탕으로 집계되므로 실제 질병 유병 규모와 차이가 있을 수 있습니다.
+5. 연령대별 환자 수의 상관관계는 연령이라는 공통 요인의 영향을 받을 수 있습니다.
+6. 본 분석은 상관관계를 탐구하며 인과관계를 증명하는 연구가 아닙니다.
+""")
+
+
+st.caption(
+    "자료 출처: 건강보험심사평가원 "
+    "3단상병별 성별 연령군별 통계(2025년)"
+)
