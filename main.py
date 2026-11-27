@@ -1,4 +1,5 @@
-import platform
+import os
+import urllib.request
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,24 +12,16 @@ st.set_page_config(
     layout="wide",
 )
 
+# 1. 한글 폰트 파일 자동 다운로드 및 강제 적용 (한글 깨짐 100% 방지)
+FONT_FILE = "NanumGothic.ttf"
+if not os.path.exists(FONT_FILE):
+    url = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+    urllib.request.urlretrieve(url, FONT_FILE)
 
-# 1. OS별 한글 폰트 자동 설정 (한글 깨짐 방지)
-def set_korean_font():
-    system_name = platform.system()
-    if system_name == "Windows":
-        plt.rcParams["font.family"] = "Malgun Gothic"
-    elif system_name == "Darwin":  # Mac OS
-        plt.rcParams["font.family"] = "AppleGothic"
-    else:  # Linux / Streamlit Cloud 등
-        font_list = [f.name for f in fm.fontManager.ttflist]
-        if "NanumGothic" in font_list:
-            plt.rcParams["font.family"] = "NanumGothic"
-        elif "Malgun Gothic" in font_list:
-            plt.rcParams["font.family"] = "Malgun Gothic"
-    plt.rcParams["axes.unicode_minus"] = False
-
-
-set_korean_font()
+fm.fontManager.addfont(FONT_FILE)
+font_name = fm.FontProperties(fname=FONT_FILE).get_name()
+plt.rcParams["font.family"] = font_name
+plt.rcParams["axes.unicode_minus"] = False
 
 FILE_PATH = "건강보험심사평가원_3단상병별 성별 연령군별 통계_20251231.csv"
 
@@ -127,7 +120,7 @@ st.markdown(
 # 3. 그래프 및 상관분석 결과
 st.header("3. 연령군별 환자 수 그래프 및 상관계수")
 
-# 상관계수 먼저 계산 (산점도 제목/범례에 활용)
+# 상관계수 계산
 pearson_r, pearson_p = stats.pearsonr(
     merged["치주질환_K05_환자수"], merged["제2형당뇨병_E11_환자수"]
 )
@@ -179,9 +172,8 @@ with chart_col2:
         label=f"추세선 (r = {pearson_r:.2f})",
     )
 
-    # 주요 연령군 라벨 표시 (겹침 방지를 위해 일부 간격 또는 전체 표시)
+    # 각 점에 연령대 라벨 표시
     for i, row in merged.iterrows():
-        # 앞의 숫자 코드(예: '01_')를 떼고 연령대 텍스트만 깔끔하게 표시
         short_label = row["연령군"].split("_")[-1] if "_" in row["연령군"] else row["연령군"]
         ax2.annotate(
             short_label,
